@@ -16,3 +16,10 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Other files
+sample_seed.py
+sample_data
+DATA_MODEL.md
+openapi.yaml
+PROBLEM_STATEMENT.docx
