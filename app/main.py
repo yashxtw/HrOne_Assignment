@@ -245,6 +245,73 @@ def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
     ]
 
 
+def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
+    start, end, _, _ = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": start, "$lte": end}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_day_expr()},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+def department_summary_pipeline(month: str, department: Optional[str]) -> list[dict]:
+    start, end, _, _ = month_bounds(month)
+    match: dict[str, Any] = {"joined_on": {"$lte": end}}
+    if department is not None:
+        match["department"] = department
+    return [
+        {"$match": match},
+        {"$lookup": {
+            "from": "attendance_logs", "let": {"code": "$emp_code"},
+            "pipeline": [{"$match": {"$expr": {"$and": [
+                {"$eq": ["$emp_code", "$$code"]}, {"$gte": ["$date", start]}, {"$lte": ["$date", end]}
+            ]}}}], "as": "logs"
+        }},
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {"$group": {
+            "_id": {"emp_code": "$emp_code", "department": "$department"},
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [
+                    {"$ne": [{"$ifNull": ["$logs.date", None]}, None]},
+                    {"$in": ["$logs.status", list(PRESENCE_STATUSES)]},
+                    {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": {"$ifNull": ["$logs.date", "1970-01-01"]}}}}, 2]},
+                    {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": {"$ifNull": ["$logs.date", "1970-01-01"]}}}}, 6]},
+                ]},
+                {"$cond": [{"$eq": ["$logs.half_day", True]}, 0.5, 1.0]}, 0.0
+            ]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late_minutes", 0]}},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+            "work_hours_sum": {"$sum": {"$cond": [
+                {"$and": [{"$in": ["$logs.status", list(PRESENCE_STATUSES)]}, {"$ne": [{"$ifNull": ["$logs.work_hours", None]}, None]}]},
+                "$logs.work_hours", 0
+            ]}},
+            "work_hours_count": {"$sum": {"$cond": [
+                {"$and": [{"$in": ["$logs.status", list(PRESENCE_STATUSES)]}, {"$ne": [{"$ifNull": ["$logs.work_hours", None]}, None]}]}, 1, 0
+            ]}},
+        }},
+        {"$group": {
+            "_id": "$_id.department", "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$present_days"}, "late_count": {"$sum": "$late_count"},
+            "total_late_minutes": {"$sum": "$total_late_minutes"}, "leave_count": {"$sum": "$leave_count"},
+            "on_duty_count": {"$sum": "$on_duty_count"}, "work_hours_sum": {"$sum": "$work_hours_sum"},
+            "work_hours_count": {"$sum": "$work_hours_count"},
+        }},
+        {"$project": {
+            "_id": 0, "department": "$_id", "headcount": 1, "present_days": 1, "late_count": 1,
+            "total_late_minutes": 1, "leave_count": 1, "on_duty_count": 1,
+            "avg_work_hours": {"$cond": [{"$gt": ["$work_hours_count", 0]}, {"$divide": ["$work_hours_sum", "$work_hours_count"]}, None]},
+        }},
+        {"$sort": {"department": 1}},
+    ]
+
 
 # --------------------------------------------------------------------------- #
 # Request models
@@ -657,17 +724,25 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[
     }
 
 
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"), department: Optional[str] = None,
+):
+    try:
+        month_bounds(month)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    rows = list(employees.aggregate(department_summary_pipeline(month, department), allowDiskUse=True))
+    items = []
+    for row in rows:
+        if row.get("headcount", 0) <= 0:
+            continue
+        row["present_days"] = round_half_up(row.get("present_days", 0), 2)
+        row["avg_work_hours"] = round_half_up(row.get("avg_work_hours"), 2)
+        for field in ("headcount", "late_count", "total_late_minutes", "leave_count", "on_duty_count"):
+            row[field] = int(row.get(field, 0))
+        items.append(row)
+    return {"month": month, "items": items}    
 
 
 
-
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
