@@ -4,14 +4,16 @@ Run: uvicorn app.main:app --port 8000
 Environment: MONGO_URI and MONGO_DB (a local .env is loaded for convenience).
 """
 
+import json
 import os
 import re
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Any, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, StrictInt, Field, field_validator, model_validator
@@ -219,6 +221,34 @@ def page_parameters(page: int, page_size: int) -> tuple[int, int]:
     if not 1 <= page_size <= 100:
         raise HTTPException(422, "page_size must be between 1 and 100")
     return (page - 1) * page_size, page_size
+
+
+def make_attendance_query(emp_code=None, date_from=None, date_to=None, status=None) -> dict:
+    query: dict[str, Any] = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+    return query
+
+
+def validate_attendance_filters(date_from, date_to, status):
+    for label, value in (("date_from", date_from), ("date_to", date_to)):
+        if value is not None:
+            try:
+                validate_date_string(value)
+            except ValueError as exc:
+                raise HTTPException(422, detail=str(exc)) from exc
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must be on or before date_to")
+    if status is not None and status not in ALL_STATUSES:
+        raise HTTPException(422, "invalid attendance status")
 
 
 def present_day_expr(date_field: str = "$date") -> dict:
@@ -866,3 +896,79 @@ def department_trend(department: str, from_date: str = Query(..., alias="from"),
     return {"department": department, "items": items}
 
 
+# --------------------------------------------------------------------------- #
+# Explain endpoints
+# --------------------------------------------------------------------------- #
+def bson_json(value: Any) -> Any:
+    return json.loads(json_util.dumps(value))
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if endpoint not in {"attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"}:
+        raise HTTPException(422, "unsupported endpoint")
+    skip, size = page_parameters(page, page_size)
+    if endpoint == "attendance_list":
+        validate_attendance_filters(date_from, date_to, status)
+        query = make_attendance_query(emp_code, date_from, date_to, status)
+        explain = db.command("explain", {
+            "find": "attendance_logs", "filter": query,
+            "sort": {"date": -1, "emp_code": 1}, "skip": skip, "limit": size,
+        }, verbosity="executionStats")
+        collection = "attendance_logs"
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(422, "emp_code and month are required")
+        try:
+            month_bounds(month)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        explain = db.command("explain", {"aggregate": "attendance_logs", "pipeline": employee_monthly_pipeline(emp_code, month), "cursor": {}}, verbosity="executionStats")
+        collection = "attendance_logs"
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(422, "month is required")
+        try:
+            month_bounds(month)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        explain = db.command("explain", {"aggregate": "employees", "pipeline": department_summary_pipeline(month, department), "cursor": {}}, verbosity="executionStats")
+        collection = "employees"
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(422, "month is required")
+        try:
+            month_bounds(month)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        pipeline = leaderboard_pipeline(month, department)
+        pipeline.append({"$match": {"rank": {"$lte": limit}}})
+        explain = db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        collection = "attendance_logs"
+    else:
+        if not department or not from_date or not to_date:
+            raise HTTPException(422, "department, from and to are required")
+        try:
+            validate_date_string(from_date)
+            validate_date_string(to_date)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        count = (date.fromisoformat(to_date) - date.fromisoformat(from_date)).days + 1
+        if count <= 0 or count > 92:
+            raise HTTPException(422, "trend range must be 1-92 inclusive days")
+        explain = db.command("explain", {"aggregate": 1, "pipeline": department_trend_pipeline(department, from_date, to_date), "cursor": {}}, verbosity="executionStats")
+        collection = "$documents + employees + attendance_logs"
+    return {"endpoint": endpoint, "collection": collection, "explain": bson_json(explain)}
