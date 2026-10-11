@@ -141,7 +141,7 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, attendance_date: 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = (truncate_to_seconds(punch_out) - truncate_to_seconds(punch_in)).total_seconds()
     value = (Decimal(str(seconds)) / Decimal("3600")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return float(value)
+    return float(value)     
 
 
 def compute_overtime(punch_out: datetime, shift_end: str, attendance_date: str, shift_start: Optional[str] = None) -> int:
@@ -213,7 +213,8 @@ class EmployeeIn(BaseModel):
     @field_validator("name")
     @classmethod
     def valid_name(cls, value: str) -> str:
-        if not value.strip() or len(value) > 100:
+        value = value.strip()
+        if not value or len(value) > 100:
             raise ValueError("name must contain 1-100 characters")
         return value
 
@@ -227,7 +228,8 @@ class EmployeeIn(BaseModel):
     @field_validator("department")
     @classmethod
     def valid_department(cls, value: str) -> str:
-        if not value.strip() or len(value) > 50:
+        value = value.strip()
+        if not value or len(value) > 50:
             raise ValueError("department must contain 1-50 characters")
         return value
 
