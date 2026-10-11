@@ -14,7 +14,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, StrictInt, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -202,9 +202,9 @@ class EmployeeIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     emp_code: str
-    name: str
-    email: str
-    department: str
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120)
+    department: str = Field(min_length=1, max_length=50)
     shift_start: str = "09:30"
     shift_end: str = "18:30"
     joined_on: str
@@ -220,14 +220,14 @@ class EmployeeIn(BaseModel):
     @classmethod
     def valid_name(cls, value: str) -> str:
         value = value.strip()
-        if not value or len(value) > 100:
-            raise ValueError("name must contain 1-100 characters")
+        if not value:
+            raise ValueError("name must not be blank")
         return value
 
     @field_validator("email")
     @classmethod
     def valid_email(cls, value: str) -> str:
-        if len(value) > 120 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
             raise ValueError("email is invalid")
         return value
 
@@ -235,8 +235,8 @@ class EmployeeIn(BaseModel):
     @classmethod
     def valid_department(cls, value: str) -> str:
         value = value.strip()
-        if not value or len(value) > 50:
-            raise ValueError("department must contain 1-50 characters")
+        if not value:
+            raise ValueError("department must not be blank")
         return value
 
     @field_validator("shift_start", "shift_end")
@@ -263,18 +263,86 @@ class PunchInIn(BaseModel):
     punched_at: Optional[StrictInt] = None
     status: str = "PRESENT"
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null_timestamp(cls, data):
+        if isinstance(data, dict) and "punched_at" in data and data["punched_at"] is None:
+            raise ValueError("punched_at must be an integer epoch-millisecond value")
+        return data
+
     @field_validator("punched_at")
     @classmethod
-    def valid_timestamp(cls, value: Optional[int]) -> Optional[int]:
+    def valid_timestamp(cls, value):
         if value is not None and not MIN_EPOCH_MS <= value <= MAX_EPOCH_MS:
             raise ValueError("punched_at must be epoch milliseconds in the supported range")
         return value
 
     @field_validator("status")
     @classmethod
-    def valid_status(cls, value: str) -> str:
+    def valid_status(cls, value):
         if value not in PRESENCE_STATUSES:
             raise ValueError("status must be PRESENT, WFH, or ON_DUTY")
+        return value
+
+
+class PunchOutIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    
+    emp_code: str
+    punched_at: Optional[StrictInt] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null_timestamp(cls, data):
+        if isinstance(data, dict) and "punched_at" in data and data["punched_at"] is None:
+            raise ValueError("punched_at must be an integer epoch-millisecond value")
+        return data
+
+    @field_validator("punched_at")
+    @classmethod
+    def valid_timestamp(cls, value):
+        if value is not None and not MIN_EPOCH_MS <= value <= MAX_EPOCH_MS:
+            raise ValueError("punched_at must be epoch milliseconds in the supported range")
+        return value
+
+
+class RegularizeIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    
+    status: Optional[str] = None
+    punch_in: Optional[StrictInt] = None
+    punch_out: Optional[StrictInt] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null_punch_times(cls, data):
+        if isinstance(data, dict):
+            for key in ("punch_in", "punch_out", "status"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} must not be null")
+        return data
+
+    @field_validator("status")
+    @classmethod
+    def valid_status(cls, value):
+        if value is not None and value not in ALL_STATUSES:
+            raise ValueError("invalid attendance status")
+        return value
+
+    @field_validator("punch_in", "punch_out")
+    @classmethod
+    def valid_timestamp(cls, value):
+        if value is not None and not MIN_EPOCH_MS <= value <= MAX_EPOCH_MS:
+            raise ValueError("timestamp must be epoch milliseconds in the supported range")
+        return value
+
+    @field_validator("regularized_by")
+    @classmethod
+    def nonblank_by(cls, value):
+        if not value.strip():
+            raise ValueError("regularized_by must not be blank")
         return value
 
 
@@ -394,6 +462,18 @@ def list_attendance(
     )
     items = [serialize_attendance(doc) for doc in cursor]
     return {"items": items, "total": total, "page": page, "page_size": size}
+
+
+# --------------------------------------------------------------------------- #
+# New endpoints added
+# --------------------------------------------------------------------------- #
+
+
+
+
+
+
+
 
 
 # --------------------------------------------------------------------------- #
