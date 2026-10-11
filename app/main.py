@@ -36,20 +36,24 @@ client = MongoClient(
     serverSelectionTimeoutMS=5_000,
 )
 db = client[os.getenv("MONGO_DB", "attendance_db")]
+employees = db.employees
+attendance_logs = db.attendance_logs
 indexes_ready = False
 
 
 def create_indexes() -> None:
     """Create required indexes idempotently; unique indexes enforce race safety."""
-    db.employees.create_index([("emp_code", 1)], unique=True, name="uq_employee_code")
-    db.employees.create_index([("department", 1), ("emp_code", 1)], name="ix_employee_department_code")
-    db.employees.create_index([("joined_on", 1), ("department", 1)], name="ix_employee_joined_department")
-    db.attendance_logs.create_index(
+    employees.create_index([("emp_code", 1)], unique=True, name="uq_employee_code")
+    employees.create_index([("department", 1), ("emp_code", 1)], name="ix_employee_department_code")
+    employees.create_index([("joined_on", 1), ("department", 1)], name="ix_employee_joined_department")
+    attendance_logs.create_index(
         [("emp_code", 1), ("date", 1)], unique=True, name="uq_attendance_employee_date"
     )
-    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="ix_attendance_date_employee")
-    db.attendance_logs.create_index([("emp_code", 1), ("date", -1)], name="ix_attendance_employee_date_desc")
-    db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)], name="ix_attendance_status_date_employee")
+    attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="ix_attendance_date_employee")
+    attendance_logs.create_index([("emp_code", 1), ("date", -1)], name="ix_attendance_employee_date_desc")
+    attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)], name="ix_attendance_status_date_employee")
+    attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="ix_attendance_employee_punchin")
+    attendance_logs.create_index([("date", 1), ("late_minutes", 1), ("emp_code", 1)], name="ix_attendance_date_late_employee")
 
 
 @asynccontextmanager
