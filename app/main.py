@@ -347,7 +347,7 @@ class RegularizeIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints present in the starter (reviewed and corrected)
+# Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
@@ -483,9 +483,9 @@ def list_attendance(
     if status is not None:
         query["status"] = status
 
-    total = db.attendance_logs.count_documents(query)
+    total = attendance_logs.count_documents(query)
     cursor = (
-        db.attendance_logs.find(query)
+        attendance_logs.find(query)
         .sort([("date", -1), ("emp_code", 1)])
         .skip(skip)
         .limit(size)
@@ -494,9 +494,93 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": size}
 
 
-# --------------------------------------------------------------------------- #
-# New endpoints added
-# --------------------------------------------------------------------------- #
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    try:
+        validate_date_string(date)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    if employees.find_one({"emp_code": emp_code}, {"_id": 1}) is None:
+        raise HTTPException(404, "employee not found")
+    record = attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "attendance record not found")
+    emp = employees.find_one({"emp_code": emp_code})
+    supplied = body.model_fields_set
+    current_status = record.get("status")
+    final_status = body.status if "status" in supplied else current_status
+    current_in = record.get("punch_in")
+    current_out = record.get("punch_out")
+    final_in = epoch_ms_to_datetime(body.punch_in) if "punch_in" in supplied and body.punch_in is not None else current_in
+    final_out = epoch_ms_to_datetime(body.punch_out) if "punch_out" in supplied and body.punch_out is not None else current_out
+
+    if final_status in {"ABSENT", "LEAVE"}:
+        if "punch_in" in supplied or "punch_out" in supplied:
+            raise HTTPException(422, "punch times cannot be supplied with ABSENT or LEAVE")
+        final_in = final_out = None
+    elif final_status in PRESENCE_STATUSES and final_in is None:
+        raise HTTPException(422, "presence status requires punch_in")
+
+    if final_in is not None:
+        final_in = truncate_to_seconds(final_in)
+        if attendance_date_for_punch(final_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in must belong to the record attendance date")
+    if final_out is not None:
+        final_out = truncate_to_seconds(final_out)
+        if final_in is None:
+            raise HTTPException(422, "punch_out requires punch_in")
+        seconds = (final_out - final_in).total_seconds()
+        if seconds <= 0 or seconds > 24 * 60 * 60:
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+
+    if final_status in {"ABSENT", "LEAVE"}:
+        late, hours, overtime, half_day = 0, None, 0, False
+    else:
+        late = compute_late_minutes(final_in, emp["shift_start"], date)
+        if final_out is None:
+            hours, overtime, half_day = None, 0, False
+        else:
+            hours = compute_work_hours(final_in, final_out)
+            overtime = compute_overtime(final_out, emp["shift_end"], date, emp["shift_start"])
+            half_day = hours < 4.50
+
+    before = {
+        "status": current_status, "punch_in": current_in, "punch_out": current_out,
+        "work_hours": record.get("work_hours"), "late_minutes": record.get("late_minutes", 0),
+        "overtime_minutes": record.get("overtime_minutes", 0), "half_day": record.get("half_day", False),
+    }
+    after = {
+        "status": final_status, "punch_in": final_in, "punch_out": final_out,
+        "work_hours": hours, "late_minutes": late, "overtime_minutes": overtime, "half_day": half_day,
+    }
+    changes = {}
+    for field in before:
+        old, new = before[field], after[field]
+        if field in {"punch_in", "punch_out"}:
+            old_cmp = truncate_to_seconds(old) if old is not None else None
+            new_cmp = truncate_to_seconds(new) if new is not None else None
+        else:
+            old_cmp, new_cmp = old, new
+        if old_cmp != new_cmp:
+            if field in {"punch_in", "punch_out"}:
+                changes[field] = {"from": old_cmp, "to": new_cmp}
+            else:
+                changes[field] = {"from": old, "to": new}
+    if not changes:
+        raise HTTPException(422, "request does not change the record")
+
+    at = truncate_to_seconds(datetime.now(UTC))
+    history_entry = {"at": at, "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    history_filter = {"history": record["history"]} if "history" in record else {"history": {"$exists": False}}
+    update_filter = {"_id": record["_id"], **history_filter}
+    updated = attendance_logs.find_one_and_update(
+        update_filter,
+        {"$set": after, "$push": {"history": history_entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record was changed by another request; retry")
+    return serialize_attendance(updated)
 
 
 
