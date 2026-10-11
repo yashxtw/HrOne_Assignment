@@ -331,6 +331,54 @@ def leaderboard_pipeline(month: str, department: Optional[str]) -> list[dict]:
     return pipeline    
 
 
+def department_trend_pipeline(department: str, from_date: str, to_date: str) -> list[dict]:
+    start = date.fromisoformat(from_date)
+    count = (date.fromisoformat(to_date) - start).days + 1
+    # $documents + $range gap-fills dates entirely in MongoDB, including a department with no logs.
+    return [
+        {"$documents": [{"start": datetime.combine(start, time.min, tzinfo=UTC), "count": count}]},
+        {"$project": {"dates": {"$map": {"input": {"$range": [0, "$count"]}, "as": "offset", "in": {"$dateToString": {"date": {"$dateAdd": {"startDate": "$start", "unit": "day", "amount": "$$offset"}}, "format": "%Y-%m-%d", "timezone": "UTC"}}}}}},
+        {"$unwind": "$dates"},
+        {"$project": {"date": "$dates"}},
+        {"$lookup": {
+            "from": "employees", "let": {"day": "$date"},
+            "pipeline": [{"$match": {"$expr": {"$and": [
+                {"$eq": ["$department", department]}, {"$lte": ["$joined_on", "$$day"]}
+            ]}}}, {"$count": "count"}], "as": "heads"
+        }},
+        {"$lookup": {
+            "from": "attendance_logs", "let": {"day": "$date"},
+            "pipeline": [
+                {"$match": {"$expr": {"$eq": ["$date", "$$day"]}}},
+                {"$lookup": {
+                    "from": "employees", "let": {"code": "$emp_code"},
+                    "pipeline": [{"$match": {"$expr": {"$and": [{"$eq": ["$emp_code", "$$code"]}, {"$eq": ["$department", department]}]}}}, {"$project": {"_id": 1}}],
+                    "as": "matching_employee"
+                }},
+                {"$match": {"matching_employee.0": {"$exists": True}}},
+                {"$project": {"status": 1, "late_minutes": 1, "half_day": 1}}
+            ], "as": "logs"
+        }},
+        {"$project": {
+            "_id": 0, "date": 1,
+            "headcount": {"$ifNull": [{"$arrayElemAt": ["$heads.count", 0]}, 0]},
+            "present_count": {"$sum": {"$map": {"input": "$logs", "as": "log", "in": {"$cond": [
+                {"$in": ["$$log.status", list(PRESENCE_STATUSES)]}, {"$cond": [{"$eq": ["$$log.half_day", True]}, 0.5, 1.0]}, 0.0
+            ]}}}},
+            "late_count": {"$size": {"$filter": {"input": "$logs", "as": "log", "cond": {"$gt": [{"$ifNull": ["$$log.late_minutes", 0]}, 0]}}}},
+            "is_working_day": {"$and": [
+                {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 2]},
+                {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 6]}
+            ]}
+        }},
+        {"$set": {"attendance_rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]}, {"$divide": ["$present_count", "$headcount"]}, None
+        ]}}},
+        {"$sort": {"date": 1}},
+    ]
+
+
+
 # --------------------------------------------------------------------------- #
 # Request models
 # --------------------------------------------------------------------------- #
@@ -780,5 +828,41 @@ def late_leaderboard(
         "department": row["department"], "total_late_minutes": int(row["total_late_minutes"]),
         "late_count": int(row["late_count"]),
     } for row in rows]}
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, from_date: str = Query(..., alias="from"), to_date: str = Query(..., alias="to")):
+    try:
+        validate_date_string(from_date)
+        validate_date_string(to_date)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    start, end = date.fromisoformat(from_date), date.fromisoformat(to_date)
+    count = (end - start).days + 1
+    if count <= 0:
+        raise HTTPException(422, "to must be on or after from")
+    if count > 92:
+        raise HTTPException(422, "date range must not exceed 92 days")
+    if employees.count_documents({"department": department}) == 0:
+        raise HTTPException(404, "department not found")
+    rows = list(db.aggregate(department_trend_pipeline(department, from_date, to_date), allowDiskUse=True))
+    items = []
+    for row in rows:
+        is_working = bool(row["is_working_day"])
+        headcount = int(row["headcount"])
+        present_count = round_half_up(row.get("present_count", 0), 2)
+        rate = round_half_up((present_count / headcount), 4) if is_working and headcount > 0 else None
+        items.append({
+            "date": row["date"], "is_working_day": is_working, "headcount": headcount,
+            "present_count": present_count, "late_count": int(row["late_count"]),
+            "attendance_rate": rate, "moving_avg_7d": None,
+        })
+    # Gap filling and daily counts happen in MongoDB; this final pass averages the
+    # already half-up-rounded reported rates, excluding nulls exactly as specified.
+    for index, item in enumerate(items):
+        window_rates = [x["attendance_rate"] for x in items[max(0, index - 6):index + 1] if x["attendance_rate"] is not None]
+        if window_rates:
+            item["moving_avg_7d"] = round_half_up(sum(Decimal(str(x)) for x in window_rates) / Decimal(len(window_rates)), 4)
+    return {"department": department, "items": items}
 
 
