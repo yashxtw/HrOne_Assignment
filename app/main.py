@@ -36,6 +36,7 @@ client = MongoClient(
     serverSelectionTimeoutMS=5_000,
 )
 db = client[os.getenv("MONGO_DB", "attendance_db")]
+indexes_ready = False
 
 
 def create_indexes() -> None:
@@ -53,13 +54,14 @@ def create_indexes() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # The process must still start when MongoDB is temporarily unavailable so
-    # /health can correctly report 503; indexes are retried on a successful ping.
+    global indexes_ready
     try:
         create_indexes()
+        indexes_ready = True
     except PyMongoError:
-        logger.exception("MongoDB unavailable while creating startup indexes")
+        logger.exception("Failed to create MongoDB indexes during startup")
     yield
+    client.close()
 
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
@@ -277,11 +279,14 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    global indexes_ready
     try:
         db.command("ping")
-        create_indexes()
+        if not indexes_ready:
+            create_indexes()
+            indexes_ready = True
     except PyMongoError as exc:
-        raise HTTPException(status_code=503, detail="MongoDB unavailable") from exc
+        raise HTTPException(status_code=503, detail="MongoDB unavailable or not initialized") from exc
     return {"status": "ok"}
 
 
