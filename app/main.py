@@ -161,6 +161,32 @@ def compute_overtime(punch_out: datetime, shift_end: str, attendance_date: str, 
     return whole_minutes if whole_minutes >= 30 else 0
 
 
+def round_half_up(value: Any, places: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    quantum = Decimal("1").scaleb(-places)
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def validate_month(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        raise ValueError("month must be YYYY-MM")
+    return value
+
+
+def month_bounds(month: str) -> tuple[str, str, date, date]:
+    validate_month(month)
+    year, mon = map(int, month.split("-"))
+    start = date(year, mon, 1)
+    end = date(year + (mon == 12), 1 if mon == 12 else mon + 1, 1) - timedelta(days=1)
+    return start.isoformat(), end.isoformat(), start, end
+
+
+def working_days(start: date, end: date) -> int:
+    if start > end:
+        return 0
+    return sum(1 for offset in range((end - start).days + 1) if (start + timedelta(days=offset)).weekday() < 5)
+
 def serialize_employee(doc: dict) -> dict:
     result = {key: value for key, value in doc.items() if key != "_id"}
     if "created_at" in result:
@@ -193,6 +219,31 @@ def page_parameters(page: int, page_size: int) -> tuple[int, int]:
     if not 1 <= page_size <= 100:
         raise HTTPException(422, "page_size must be between 1 and 100")
     return (page - 1) * page_size, page_size
+
+
+def present_day_expr(date_field: str = "$date") -> dict:
+    parsed = {"$dateFromString": {"dateString": date_field, "format": "%Y-%m-%d"}}
+    weekday = {"$dayOfWeek": parsed}  # Sunday=1, Saturday=7
+    is_weekday = {"$and": [{"$gte": [weekday, 2]}, {"$lte": [weekday, 6]}]}
+    is_present = {"$in": ["$status", list(PRESENCE_STATUSES)]}
+    amount = {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]}
+    return {"$cond": [{"$and": [is_weekday, is_present]}, amount, 0.0]}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
+    start, end, _, _ = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": start, "$lte": end}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_day_expr()},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
 
 
 # --------------------------------------------------------------------------- #
@@ -583,7 +634,27 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     return serialize_attendance(updated)
 
 
-
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
+    try:
+        start_s, end_s, start, end = month_bounds(month)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    emp = employees.find_one({"emp_code": emp_code}, {"_id": 0, "joined_on": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    joined = date.fromisoformat(emp["joined_on"])
+    working = working_days(max(joined, start), end)
+    agg = list(attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
+    stats = agg[0] if agg else {}
+    present = float(stats.get("present_days", 0.0))
+    pct = round_half_up((present / working) * 100, 4) if working else None
+    return {
+        "emp_code": emp_code, "month": month, "working_days": working,
+        "present_days": round_half_up(present, 2), "leave_days": int(stats.get("leave_days", 0)),
+        "late_count": int(stats.get("late_count", 0)), "total_late_minutes": int(stats.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(stats.get("total_overtime_minutes", 0)), "attendance_pct": pct,
+    }
 
 
 
