@@ -313,6 +313,24 @@ def department_summary_pipeline(month: str, department: Optional[str]) -> list[d
     ]
 
 
+def leaderboard_pipeline(month: str, department: Optional[str]) -> list[dict]:
+    start, end, _, _ = month_bounds(month)
+    pipeline: list[dict] = [
+        {"$match": {"date": {"$gte": start, "$lte": end}, "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "employee"}},
+        {"$unwind": "$employee"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"employee.department": department}})
+    pipeline.extend([
+        {"$project": {"_id": 0, "emp_code": "$_id", "name": "$employee.name", "department": "$employee.department", "total_late_minutes": 1, "late_count": 1}},
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
+    ])
+    return pipeline    
+
+
 # --------------------------------------------------------------------------- #
 # Request models
 # --------------------------------------------------------------------------- #
@@ -744,5 +762,23 @@ def department_summary(
         items.append(row)
     return {"month": month, "items": items}    
 
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50), department: Optional[str] = None,
+):
+    try:
+        month_bounds(month)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    pipeline = leaderboard_pipeline(month, department)
+    pipeline.append({"$match": {"rank": {"$lte": limit}}})
+    rows = list(attendance_logs.aggregate(pipeline, allowDiskUse=True))
+    return {"month": month, "items": [{
+        "rank": int(row["rank"]), "emp_code": row["emp_code"], "name": row["name"],
+        "department": row["department"], "total_late_minutes": int(row["total_late_minutes"]),
+        "late_count": int(row["late_count"]),
+    } for row in rows]}
 
 
