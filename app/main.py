@@ -15,7 +15,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, StrictInt, Field, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()  # Existing process environment variables take precedence over .env.
@@ -365,9 +365,9 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(UTC).replace(microsecond=0)
+    doc["created_at"] = truncate_to_seconds(datetime.now(UTC))
     try:
-        db.employees.insert_one(doc)
+        employees.insert_one(doc)
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="emp_code already exists") from exc
     return serialize_employee(doc)
@@ -381,20 +381,19 @@ def list_employees(
 ):
     skip, size = page_parameters(page, page_size)
     query = {"department": department} if department is not None else {}
-    total = db.employees.count_documents(query)
-    cursor = db.employees.find(query, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(size)
+    total = employees.count_documents(query)
+    cursor = employees.find(query, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(size)
     items = [serialize_employee(doc) for doc in cursor]
     return {"items": items, "total": total, "page": page, "page_size": size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code}, {"_id": 0})
+    emp = employees.find_one({"emp_code": body.emp_code}, {"_id": 0})
     if emp is None:
         raise HTTPException(status_code=404, detail="employee not found")
 
-    ts = epoch_ms_to_datetime(body.punched_at) if body.punched_at is not None else datetime.now(UTC).replace(microsecond=0)
-    ts = truncate_to_seconds(ts)
+    ts = epoch_ms_to_datetime(body.punched_at) if body.punched_at is not None else truncate_to_seconds(datetime.now(UTC))
     attendance_date = attendance_date_for_punch(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
@@ -410,10 +409,41 @@ def punch_in(body: PunchInIn):
     }
     # The unique (emp_code, date) index, not a racy pre-check, arbitrates concurrent requests.
     try:
-        db.attendance_logs.insert_one(doc)
+        attendance_logs.insert_one(doc)
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="already punched in for this date") from exc
     return serialize_attendance(doc)
+
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = epoch_ms_to_datetime(body.punched_at) if body.punched_at is not None else truncate_to_seconds(datetime.now(UTC))
+    record = attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": ts}},
+        sort=[("punch_in", -1), ("date", -1)],
+    )
+    if record is None:
+        raise HTTPException(404, "no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, "record already punched out")
+    punch_in_dt = truncate_to_seconds(record["punch_in"])
+    elapsed = (ts - punch_in_dt).total_seconds()
+    if elapsed <= 0 or elapsed > 24 * 60 * 60:
+        raise HTTPException(422, "punched_at must be after punch_in and no more than 24 hours later")
+    hours = compute_work_hours(punch_in_dt, ts)
+    overtime = compute_overtime(ts, emp["shift_end"], record["date"], emp["shift_start"])
+    half_day = hours < 4.50
+    updated = attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": {"punch_out": ts, "work_hours": hours, "overtime_minutes": overtime, "half_day": half_day}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record already punched out")
+    return serialize_attendance(updated)
 
 
 @app.get("/attendance")
