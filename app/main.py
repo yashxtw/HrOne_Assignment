@@ -275,21 +275,6 @@ def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
     ]
 
 
-def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
-    start, end, _, _ = month_bounds(month)
-    return [
-        {"$match": {"emp_code": emp_code, "date": {"$gte": start, "$lte": end}}},
-        {"$group": {
-            "_id": None,
-            "present_days": {"$sum": present_day_expr()},
-            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
-            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
-            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
-            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
-        }},
-    ]
-
-
 def department_summary_pipeline(month: str, department: Optional[str]) -> list[dict]:
     start, end, _, _ = month_bounds(month)
     match: dict[str, Any] = {"joined_on": {"$lte": end}}
